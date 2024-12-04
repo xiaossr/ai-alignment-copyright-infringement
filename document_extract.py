@@ -1,6 +1,6 @@
 import PIL.IcnsImagePlugin
 from dotenv import load_dotenv
-load_dotenv("C:\\Users\\xiaog\\Desktop\\stuff\\fall24\\urop\\headers.env")
+load_dotenv("C:\\Users\\xiaog\\Dropbox (MIT)\\urop\\secret.env")
 import sys
 import google.generativeai as genai
 import os
@@ -15,6 +15,7 @@ import csv
 import shutil
 import validators
 import pdfplumber
+import re
 
 headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0',
            'Cookie' : 'aws-waf-token=' + os.environ['AWS_WAF_TOKEN']}
@@ -23,7 +24,9 @@ genai.configure(api_key=os.environ["GEMINI_API_KEY"])
 # media = pathlib.Path(__file__).parents[0] / "francesca-gregorini-v-apple-inc"
 calls = ["Find the winner of this case given the following pdfs; if there is no clear winner or final outcome, **tell me the side which is favored** - plantiff or defendant; for whichever side has more possibility of winning, include a statement like 'plaintiff wins' or 'defendant wins'. If initially one side was favored but then rulings were reversed, and that reversal has not been overturned, state the side that was reversed in favor", 
             "Classify the content of this legal document into one of the following categories: \ncase details: Content related to the initial complaint and general context about the case itself. \ncase verdict: Files which contain the verdict of the case, indicating which party (plaintiff or defendant) prevailed. \nother: Any additional content, including court notices, orders, fees, proposed statements, agreements between parties, or summons",
-            "Classify this image, which is contained in the following pdf, as belonging to the plaintiff (a.k.a **plantiff image**), the defendant (a.k.a. **defendant image**), or **neither** (irrelevant image). Especially note that some images may be placed next to each other, in which case it is important to differentiate whether the plantiff's image or the defendant's image is on the left or the right. First determine the location of the image in the pdf, then use surrounding captions and context from the pdf to determine this. Each image can only be from either the plantiff or the defendant, not both. "]
+            "Classify this image, which is contained in the following pdf, as belonging to the plaintiff (a.k.a **plantiff image**), the defendant (a.k.a. **defendant image**), or **neither** (irrelevant image). Especially note that some images may be placed next to each other, in which case it is important to differentiate whether the plantiff's image or the defendant's image is on the left or the right. First determine the location of the image in the pdf, then use surrounding captions and context from the pdf to determine this. Each image can only be from either the plantiff or the defendant, not both. ",
+            "Classify the description of this legal document into one of the following categories: \ncase details: Content related to the complaint, such as complaint or statement and defendant responses. \ncase verdict: the judgement or ruling of the case, indicating which party (plaintiff or defendant) prevailed. \nother: Any additional content, including court notices, orders, fees, proposed statements, agreements between parties, or summons"
+]
 text_classifications = ['case details', 'case verdict']
 image_classifications = ['plaintiff image', 'defendant image']
 
@@ -98,6 +101,20 @@ def delete_all_files(workdir=None):
         if os.path.exists(os.path.join(workdir, "uploaded_files.txt")):
             os.remove(os.path.join(workdir, "uploaded_files.txt"))
 
+def query_model(text, model, query):
+    while True:
+        try:
+            response = model.generate_content([calls[query], text])
+            for val in text_classifications:
+                if val in response.text:
+                    return val
+        except Exception as e:
+            if "429" in str(e):
+                    time.sleep(60)
+            else:
+                print(e)
+                return "try_again"
+
 def classify_text(workdir, pdfs, model, local_pdf=False):
     """
     Classify each pdf in a given list as 'case details', 'case verdict', or 'other'. 
@@ -144,7 +161,7 @@ def classify_text(workdir, pdfs, model, local_pdf=False):
 
 def classify_single_pdf(workdir, path, model):
     """
-    Classifies a single pdf
+    Classifies a single pdf 
     """
     x = genai.upload_file(os.path.join(workdir, path), mime_type="application/pdf")
     while True:
@@ -231,15 +248,19 @@ def extract_image_from_pdf(workdir, path):
     doc = fitz.Document((os.path.join(workdir, path)))
     newdir = path.rsplit('.', 1)[0]
     os.mkdir(os.path.join(workdir, newdir))
-    for i in tqdm(range(len(doc)), desc="pages"):
-        for img in tqdm(doc.get_page_images(i), desc="page_images"):
+    for i in range(len(doc)):
+        for img in doc.get_page_images(i):
             xref = img[0]
             pix = fitz.Pixmap(doc, xref)
             if pix.width < 150 or pix.height < 150:      # eliminate extraneous images; also consider that some are full length screenshots
                 continue
 
             ## TODO: figure out plantiff/defendant and label as such
-            pix.save(os.path.join(workdir, newdir, "%s_p%s-%s.png" % (path[:-4], i, xref)))
+            try:
+                pix.save(os.path.join(workdir, newdir, "%s_p%s-%s.png" % (path[:-4], i, xref)))
+            except ValueError as e:
+                if str(e) == "ERROR unsupported colorspace for 'png'":
+                    pix.save(os.path.join(workdir, newdir, "%s_p%s-%s.jpg" % (path[:-4], i, xref)))
 
 # IDEA: extract images from pdf, upload images and pdf to api, determine whether each is plantiff or defendants'
 def classify_images(workdir, path, pdf, model, extraction_needed=False):
@@ -309,13 +330,17 @@ def extract_img(workdir):
 
     workdir: the working directory
     """
+    x = import_text_classifications(workdir)
     for path in os.listdir(workdir):
-        if ".pdf" in path:
+        if ".pdf" in path and path in x["case details"]:
             extract_image_from_pdf(workdir, path)
     return
 
+def export_single_classification(workdir, pdf, classification):
+    with open(os.path.join(workdir, "classifications.txt"), 'a') as f:
+        f.write(pdf + ', ' + classification + '\n')
 
-def download_pdf(url, workdir, model=None):
+def download_pdf(url, workdir):
     """
     Downloads the pdf that the URL points to in the working directory
 
@@ -331,9 +356,6 @@ def download_pdf(url, workdir, model=None):
             file.write(response.read())
             file.close()
 
-            if model is not None:
-                if classify_single_pdf(workdir, test[-1], model) == "other":
-                    os.remove(os.path.join(workdir, test[-1]))
             break
         except Exception as e:
             if "429" in str(e):
@@ -358,6 +380,7 @@ def clean(workdir):
             os.rmdir(folder[0])
     return
 
+keywords = [["complaint", "statement"], ["judgement", "opinion"]]
 # COURTLISTENER ONLY ATM
 def extract_from_url(url, workdir, model=None):
     """
@@ -372,6 +395,7 @@ def extract_from_url(url, workdir, model=None):
     if "courtlistener" in url:
         try:
             pdfs = set()
+            pdfs_extract = set()
 
             original_url = url
             # print(soup)
@@ -385,19 +409,45 @@ def extract_from_url(url, workdir, model=None):
                     v = soup.find('div', id='docket-entry-table')
                     # print(v)
 
-                    for link in v.find_all('a', {}):
+                    for entry in tqdm(v.find_all('div', id=re.compile("entry-"))):
                         # print(link.attrs.get('href', 'Not found'))
-                        if link.attrs.get('href', 'Not found').find('storage.courtlistener.com') != -1:
-                            # print(link.attrs.get('href', 'Not found'))
-                            # html_for_pdf = requests.get(url + link.get('href')).content
-                            # soup_for_pdf = BeautifulSoup(html_for_pdf, "html.parser")
-                            # for tot in soup_for_pdf.find_all('object', type="application/pdf"):
-                            #     s = tot.get('data')
-                            #     # eh not sure if this works, test later
-                            #     if s.find("pdf") != -1:
-                            #         pdfs.add(s)
-                            pdfs.add(link.attrs.get('href'))
-                    # break
+                        ok = False
+                        tmp = []
+                        contents = entry.find_all('div', attrs={"class":"col-xs-6 col-sm-5 col-md-6"})
+                        description = ""
+                        for content in contents:
+                            for i in range(2):
+                                for x in keywords[i]:
+                                    if x in content.find('p').get_text().lower():
+                                        ok = True
+                                        tmp = text_classifications[i]
+                                        description += content.find('p').get_text() + "\n"
+
+                        if model is not None and ok:
+                            # print("querying for " + entry["id"])
+                            verd = query_model(description, model, 3)
+                            if verd == "other":
+                                ok = False
+                            tmp = verd
+
+                        if not ok:
+                            continue
+                        links = entry.find_all('a', {})
+
+                        for link in links:
+                            if link.attrs.get('href', 'Not found').find('storage.courtlistener.com') != -1 and link.attrs.get('href').split('/')[-1] not in pdfs_extract:
+                                # print(link.attrs.get('href', 'Not found'))
+                                # html_for_pdf = requests.get(url + link.get('href')).content
+                                # soup_for_pdf = BeautifulSoup(html_for_pdf, "html.parser")
+                                # for tot in soup_for_pdf.find_all('object', type="application/pdf"):
+                                #     s = tot.get('data')
+                                #     # eh not sure if this works, test later
+                                #     if s.find("pdf") != -1:
+                                #         pdfs.add(s)
+                                pdfs.add(link.attrs.get('href'))
+                                pdfs_extract.add(link.attrs.get('href').split('/')[-1])
+                                export_single_classification(workdir, link.attrs.get('href').split('/')[-1], tmp)
+                        # break
                     
                     if not soup.find('a', rel='next'):
                         break
@@ -408,6 +458,8 @@ def extract_from_url(url, workdir, model=None):
                 except Exception as e:
                     if "429" in str(e):
                         time.sleep(60)
+                    # elif "NoneType" in str(e):
+                    #     raise Exception("AWS_WAF_TOKEN needs to be refreshed")
                     else:
                         print(e)
                         break
@@ -415,7 +467,8 @@ def extract_from_url(url, workdir, model=None):
             print("Parsed!")
 
             for pdf in tqdm(pdfs):
-                download_pdf(pdf, workdir, model)
+                download_pdf(pdf, workdir)
+
                 # print("Downloaded " + str(cnt) + " out of " + str(len(pdfs)))
         except Exception as e:
             print(url + " || Download failed: " + str(e))
@@ -460,6 +513,7 @@ def extract(url, workdir, model=None, pdf_extract=True, img_extract=True):
             extract_from_url(url, workdir, model)
         
         if img_extract:
+            print("Extracting images...")
             extract_img(workdir)
         clean(workdir)
     except Exception as e:
@@ -508,31 +562,36 @@ def read_all_csvs(workdir):
 
 def main():    
     model = genai.GenerativeModel("gemini-1.5-flash-001")
-    workdir = "C:\\Users\\xiaog\\Desktop\\stuff\\fall24\\urop"
+    workdir = "C:\\Users\\xiaog\\Dropbox (MIT)\\urop"
+    url = "https://www.courtlistener.com/docket/16696071/francesca-gregorini-v-apple-inc/"
+    # url = "https://www.courtlistener.com/docket/7586228/sony-music-entertainment-v-cox-communications-inc/"
+
+    extract(url, workdir, model=None, pdf_extract=True, img_extract=True)
+
     # read_csv("courtlistener_data.csv", workdir, None, True, False)
 
-    read_directories = import_read_directories(workdir)
-    f = open(os.path.join(workdir, "read_directories.txt"), 'a')
+    # read_directories = import_read_directories(workdir)
+    # f = open(os.path.join(workdir, "read_directories.txt"), 'a')
 
-    for pth in os.scandir(workdir):
-        if pth.is_dir() and pth.name[0].isalpha():
-            print("Current Directory: " + pth.name)
-            if pth.name in read_directories:
-                continue
+    # for pth in os.scandir(workdir):
+    #     if pth.is_dir() and pth.name[0].isalpha():
+    #         print("Current Directory: " + pth.name)
+    #         if pth.name in read_directories:
+    #             continue
             
-            # delete_all_files()
-            cur_workdir = os.path.join(workdir, pth)
-            # print(cur_workdir)
-            print("Uploading pdfs...")
-            pdfs = upload_pdfs(cur_workdir, True)
-            # export_pdfs(cur_workdir, pdfs)
+    #         # delete_all_files()
+    #         cur_workdir = os.path.join(workdir, pth)
+    #         # print(cur_workdir)
+    #         print("Uploading pdfs...")
+    #         pdfs = upload_pdfs(cur_workdir, True)
+    #         # export_pdfs(cur_workdir, pdfs)
             
-            print("Classifying text...")
-            classified = classify_text(cur_workdir, pdfs, model, True)
-            export_text_classifications(cur_workdir, classified)
-            # delete_all_files()
-            f.write(pth.name + '\n')
-    f.close()
+    #         print("Classifying text...")
+    #         classified = classify_text(cur_workdir, pdfs, model, True)
+    #         export_text_classifications(cur_workdir, classified)
+    #         # delete_all_files()
+    #         f.write(pth.name + '\n')
+    # f.close()
 
     return 0
 
